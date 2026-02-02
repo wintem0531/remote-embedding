@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
@@ -5,6 +6,9 @@ from fastapi import FastAPI, HTTPException
 from modelscope import AutoModel
 from pydantic import BaseModel, Field
 from transformers.utils.versions import require_version
+
+# 禁用 tokenizers 的并行处理,避免多线程环境下的死锁警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # 检查 transformers 版本
 require_version(

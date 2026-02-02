@@ -1,13 +1,14 @@
 import asyncio
 import base64
 import io
+import os
 import re
 import tempfile
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -15,6 +16,9 @@ from modelscope import AutoModel
 from PIL import Image
 from pydantic import BaseModel, Field
 from transformers.utils.versions import require_version
+
+# 禁用 tokenizers 的并行处理,避免多线程环境下的死锁警告
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # 检查 transformers 版本
 require_version(
