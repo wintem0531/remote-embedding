@@ -5,6 +5,7 @@ import os
 import re
 import tempfile
 import time
+import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -50,42 +51,55 @@ def process_image_input(image_input: str) -> str:
     Returns:
         可被模型处理的图片路径或 URL
     """
-    # 如果是 URL，直接返回
-    if image_input.startswith(("http://", "https://")):
-        return image_input
-
-    # 如果是本地文件路径且存在，直接返回
-    if Path(image_input).is_file():
-        return image_input
-
-    # 尝试解析 base64 数据
     try:
+        # 如果是 URL，直接返回
+        if image_input.startswith(("http://", "https://")):
+            print(f"[DEBUG] 检测到图片 URL: {image_input[:50]}...")
+            return image_input
+
+        # 如果是本地文件路径且存在，直接返回
+        if Path(image_input).is_file():
+            print(f"[DEBUG] 检测到本地文件: {image_input}")
+            return image_input
+
+        # 尝试解析 base64 数据
+        print(f"[DEBUG] 尝试解析 Base64 数据,长度: {len(image_input)}")
+
         # 处理 data URI 格式: data:image/png;base64,iVBORw0KG...
         if image_input.startswith("data:image"):
             # 提取 base64 部分
             match = re.match(r"data:image/[^;]+;base64,(.+)", image_input)
             if match:
                 base64_data = match.group(1)
+                print(f"[DEBUG] 从 data URI 提取 Base64 数据")
             else:
                 raise ValueError("无效的 data URI 格式")
         else:
             # 假设是纯 base64 字符串
             base64_data = image_input
+            print(f"[DEBUG] 使用纯 Base64 数据")
 
         # 解码 base64
         image_bytes = base64.b64decode(base64_data)
+        print(f"[DEBUG] Base64 解码成功,图片大小: {len(image_bytes)} 字节")
 
         # 转换为 PIL Image 验证是否为有效图片
         image = Image.open(io.BytesIO(image_bytes))
+        print(f"[DEBUG] PIL 图片加载成功: {image.format} {image.size}")
 
         # 保存为临时文件
         # 使用 delete=False 以便模型可以访问，程序结束时会自动清理
         suffix = f".{image.format.lower()}" if image.format else ".png"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
             image.save(tmp_file, format=image.format or "PNG")
+            print(f"[DEBUG] 图片保存为临时文件: {tmp_file.name}")
             return tmp_file.name
 
     except Exception as e:
+        print(f"[ERROR] 图片处理失败:")
+        print(f"[ERROR] 错误类型: {type(e).__name__}")
+        print(f"[ERROR] 错误信息: {str(e)}")
+        traceback.print_exc()
         raise ValueError(f"无法处理图片输入: {str(e)}")
 
 
@@ -287,6 +301,8 @@ class BatchProcessor:
                 all_texts.extend(texts)
                 text_counts.append(len(texts))
 
+            print(f"[DEBUG] 开始处理文本批次: {len(all_texts)} 个文本")
+
             # 批量推理（在线程池中执行同步调用）
             instruction = batch[0].kwargs.get("instruction")  # 使用第一个请求的 instruction
             embeddings = await asyncio.to_thread(
@@ -294,6 +310,8 @@ class BatchProcessor:
                 texts=all_texts,
                 instruction=instruction,
             )
+
+            print(f"[DEBUG] 文本嵌入完成: {embeddings.shape}")
 
             # 分发结果
             offset = 0
@@ -307,6 +325,12 @@ class BatchProcessor:
             self._update_avg_batch_size(len(batch))
 
         except Exception as e:
+            print(f"[ERROR] 文本批处理执行失败:")
+            print(f"[ERROR] 错误类型: {type(e).__name__}")
+            print(f"[ERROR] 错误信息: {str(e)}")
+            print(f"[ERROR] 错误堆栈:")
+            traceback.print_exc()
+
             # 所有请求都失败
             for req in batch:
                 if not req.future.done():
@@ -324,10 +348,14 @@ class BatchProcessor:
                 all_images.extend(images)
                 image_counts.append(len(images))
 
+            print(f"[DEBUG] 开始处理图像批次: {len(all_images)} 张图片")
+
             # 预处理图片输入（支持 URL、本地路径和 base64）
             processed_images = await asyncio.to_thread(
                 lambda: [process_image_input(img) for img in all_images]
             )
+
+            print(f"[DEBUG] 图片预处理完成,准备调用模型")
 
             # 批量推理
             is_query = batch[0].kwargs.get("is_query", True)
@@ -336,6 +364,8 @@ class BatchProcessor:
                 images=processed_images,
                 is_query=is_query,
             )
+
+            print(f"[DEBUG] 模型推理完成,嵌入向量形状: {embeddings.shape}")
 
             # 分发结果
             offset = 0
@@ -348,6 +378,12 @@ class BatchProcessor:
             self._update_avg_batch_size(len(batch))
 
         except Exception as e:
+            print(f"[ERROR] 图像批处理执行失败:")
+            print(f"[ERROR] 错误类型: {type(e).__name__}")
+            print(f"[ERROR] 错误信息: {str(e)}")
+            print(f"[ERROR] 错误堆栈:")
+            traceback.print_exc()
+
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
@@ -355,6 +391,8 @@ class BatchProcessor:
     async def _execute_fused_batch(self, batch: List[BatchRequest]):
         """执行融合嵌入批处理"""
         try:
+            print(f"[DEBUG] 开始处理融合嵌入批次: {len(batch)} 个请求")
+
             # 融合嵌入通常需要配对处理，批处理较复杂
             # 这里采用简化策略：逐个处理但在线程池中并发
             tasks = []
@@ -378,11 +416,20 @@ class BatchProcessor:
                     result = await task
                     req.future.set_result(result)
                 except Exception as e:
+                    print(f"[ERROR] 融合嵌入任务失败: {str(e)}")
+                    traceback.print_exc()
                     req.future.set_exception(e)
 
+            print(f"[DEBUG] 融合嵌入批次处理完成")
             self.stats["batched_requests"] += len(batch)
 
         except Exception as e:
+            print(f"[ERROR] 融合嵌入批处理执行失败:")
+            print(f"[ERROR] 错误类型: {type(e).__name__}")
+            print(f"[ERROR] 错误信息: {str(e)}")
+            print(f"[ERROR] 错误堆栈:")
+            traceback.print_exc()
+
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
@@ -528,9 +575,13 @@ async def get_image_embeddings(request: ImageEmbeddingRequest):
         raise HTTPException(status_code=503, detail="模型未加载")
 
     try:
+        print(f"[DEBUG] 收到图像嵌入请求: {len(request.images)} 张图片")
+
         if BatchConfig.ENABLE_BATCHING and batch_processor:
+            print(f"[DEBUG] 使用批处理模式")
             embeddings = await batch_processor.add_image_request(images=request.images, is_query=request.is_query)
         else:
+            print(f"[DEBUG] 使用直接调用模式")
             # 预处理图片输入
             processed_images = await asyncio.to_thread(
                 lambda: [process_image_input(img) for img in request.images]
@@ -541,8 +592,14 @@ async def get_image_embeddings(request: ImageEmbeddingRequest):
                 is_query=request.is_query,
             )
 
+        print(f"[DEBUG] 图像嵌入成功生成: {embeddings.shape}")
         return EmbeddingResponse(embeddings=embeddings.tolist(), dimension=embeddings.shape[1])
     except Exception as e:
+        print(f"[ERROR] 图像嵌入生成失败:")
+        print(f"[ERROR] 错误类型: {type(e).__name__}")
+        print(f"[ERROR] 错误信息: {str(e)}")
+        print(f"[ERROR] 错误堆栈:")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"嵌入生成失败: {str(e)}")
 
 
