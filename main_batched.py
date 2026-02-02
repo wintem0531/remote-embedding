@@ -1,12 +1,18 @@
 import asyncio
+import base64
+import io
+import re
+import tempfile
 import time
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Union
 
 import torch
 from fastapi import FastAPI, HTTPException
 from modelscope import AutoModel
+from PIL import Image
 from pydantic import BaseModel, Field
 from transformers.utils.versions import require_version
 
@@ -26,6 +32,59 @@ class BatchConfig:
     ENABLE_BATCHING = True  # 是否启用批处理
 
 
+# ==================== 图片预处理工具 ====================
+def process_image_input(image_input: str) -> str:
+    """
+    处理图片输入，支持 URL、本地路径和 base64 格式
+
+    Args:
+        image_input: 图片输入，可以是：
+            - URL (http:// 或 https://)
+            - 本地文件路径
+            - Base64 编码 (data:image/...;base64,... 或纯 base64 字符串)
+
+    Returns:
+        可被模型处理的图片路径或 URL
+    """
+    # 如果是 URL，直接返回
+    if image_input.startswith(("http://", "https://")):
+        return image_input
+
+    # 如果是本地文件路径且存在，直接返回
+    if Path(image_input).is_file():
+        return image_input
+
+    # 尝试解析 base64 数据
+    try:
+        # 处理 data URI 格式: data:image/png;base64,iVBORw0KG...
+        if image_input.startswith("data:image"):
+            # 提取 base64 部分
+            match = re.match(r"data:image/[^;]+;base64,(.+)", image_input)
+            if match:
+                base64_data = match.group(1)
+            else:
+                raise ValueError("无效的 data URI 格式")
+        else:
+            # 假设是纯 base64 字符串
+            base64_data = image_input
+
+        # 解码 base64
+        image_bytes = base64.b64decode(base64_data)
+
+        # 转换为 PIL Image 验证是否为有效图片
+        image = Image.open(io.BytesIO(image_bytes))
+
+        # 保存为临时文件
+        # 使用 delete=False 以便模型可以访问，程序结束时会自动清理
+        suffix = f".{image.format.lower()}" if image.format else ".png"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            image.save(tmp_file, format=image.format or "PNG")
+            return tmp_file.name
+
+    except Exception as e:
+        raise ValueError(f"无法处理图片输入: {str(e)}")
+
+
 # ==================== Pydantic 模型定义 ====================
 class TextEmbeddingRequest(BaseModel):
     texts: List[str] = Field(..., description="要嵌入的文本列表")
@@ -33,18 +92,29 @@ class TextEmbeddingRequest(BaseModel):
 
 
 class ImageEmbeddingRequest(BaseModel):
-    images: List[str] = Field(..., description="图像 URL 或本地路径列表")
+    images: List[str] = Field(
+        ...,
+        description="图像列表，支持三种格式：\n"
+        "1. URL (http:// 或 https://)\n"
+        "2. 本地文件路径\n"
+        "3. Base64 编码 (data:image/...;base64,... 或纯 base64 字符串)",
+    )
     is_query: bool = Field(True, description="是否为查询模式")
 
 
 class FusedEmbeddingRequest(BaseModel):
     texts: List[str] = Field(..., description="文本列表")
-    images: List[str] = Field(..., description="图像 URL 或本地路径列表")
+    images: List[str] = Field(
+        ...,
+        description="图像列表，支持 URL、本地路径或 base64 编码",
+    )
 
 
 class SimilarityRequest(BaseModel):
     texts: Optional[List[str]] = Field(None, description="文本列表")
-    images: Optional[List[str]] = Field(None, description="图像 URL 或本地路径列表")
+    images: Optional[List[str]] = Field(
+        None, description="图像列表，支持 URL、本地路径或 base64 编码"
+    )
     text_instruction: Optional[str] = Field(None, description="文本嵌入的指令")
 
 
@@ -250,11 +320,16 @@ class BatchProcessor:
                 all_images.extend(images)
                 image_counts.append(len(images))
 
+            # 预处理图片输入（支持 URL、本地路径和 base64）
+            processed_images = await asyncio.to_thread(
+                lambda: [process_image_input(img) for img in all_images]
+            )
+
             # 批量推理
             is_query = batch[0].kwargs.get("is_query", True)
             embeddings = await asyncio.to_thread(
                 self.model.get_image_embeddings,
-                images=all_images,
+                images=processed_images,
                 is_query=is_query,
             )
 
@@ -280,10 +355,16 @@ class BatchProcessor:
             # 这里采用简化策略：逐个处理但在线程池中并发
             tasks = []
             for req in batch:
+                # 预处理图片输入
+                images = req.kwargs["images"]
+                processed_images = await asyncio.to_thread(
+                    lambda imgs=images: [process_image_input(img) for img in imgs]
+                )
+
                 task = asyncio.to_thread(
                     self.model.get_fused_embeddings,
                     texts=req.kwargs["texts"],
-                    images=req.kwargs["images"],
+                    images=processed_images,
                 )
                 tasks.append((req, task))
 
@@ -446,9 +527,13 @@ async def get_image_embeddings(request: ImageEmbeddingRequest):
         if BatchConfig.ENABLE_BATCHING and batch_processor:
             embeddings = await batch_processor.add_image_request(images=request.images, is_query=request.is_query)
         else:
+            # 预处理图片输入
+            processed_images = await asyncio.to_thread(
+                lambda: [process_image_input(img) for img in request.images]
+            )
             embeddings = await asyncio.to_thread(
                 gme.get_image_embeddings,
-                images=request.images,
+                images=processed_images,
                 is_query=request.is_query,
             )
 
@@ -470,7 +555,13 @@ async def get_fused_embeddings(request: FusedEmbeddingRequest):
         if BatchConfig.ENABLE_BATCHING and batch_processor:
             embeddings = await batch_processor.add_fused_request(texts=request.texts, images=request.images)
         else:
-            embeddings = await asyncio.to_thread(gme.get_fused_embeddings, texts=request.texts, images=request.images)
+            # 预处理图片输入
+            processed_images = await asyncio.to_thread(
+                lambda: [process_image_input(img) for img in request.images]
+            )
+            embeddings = await asyncio.to_thread(
+                gme.get_fused_embeddings, texts=request.texts, images=processed_images
+            )
 
         return EmbeddingResponse(embeddings=embeddings.tolist(), dimension=embeddings.shape[1])
     except Exception as e:
@@ -508,8 +599,12 @@ async def calculate_similarity(request: SimilarityRequest):
             if BatchConfig.ENABLE_BATCHING and batch_processor:
                 image_embeddings = await batch_processor.add_image_request(images=request.images, is_query=False)
             else:
+                # 预处理图片输入
+                processed_images = await asyncio.to_thread(
+                    lambda: [process_image_input(img) for img in request.images]
+                )
                 image_embeddings = await asyncio.to_thread(
-                    gme.get_image_embeddings, images=request.images, is_query=False
+                    gme.get_image_embeddings, images=processed_images, is_query=False
                 )
 
         # 计算相似度
