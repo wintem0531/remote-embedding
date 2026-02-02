@@ -58,9 +58,15 @@ def process_image_input(image_input: str) -> str:
             return image_input
 
         # 如果是本地文件路径且存在，直接返回
-        if Path(image_input).is_file():
-            print(f"[DEBUG] 检测到本地文件: {image_input}")
-            return image_input
+        # 注意:先检查长度,避免 base64 字符串导致 "File name too long" 错误
+        if len(image_input) < 500:  # 合理的文件路径长度限制
+            try:
+                if Path(image_input).is_file():
+                    print(f"[DEBUG] 检测到本地文件: {image_input}")
+                    return image_input
+            except OSError:
+                # 路径无效,继续尝试作为 base64 处理
+                pass
 
         # 尝试解析 base64 数据
         print(f"[DEBUG] 尝试解析 Base64 数据,长度: {len(image_input)}")
