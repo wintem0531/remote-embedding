@@ -21,6 +21,9 @@ from transformers.utils.versions import require_version
 # 禁用 tokenizers 的并行处理,避免多线程环境下的死锁警告
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# 设置 PyTorch 内存分配器以减少内存碎片化
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # 检查 transformers 版本
 require_version(
     "transformers<4.52.0",
@@ -32,7 +35,12 @@ require_version(
 class BatchConfig:
     """批处理配置"""
 
-    MAX_BATCH_SIZE = 16  # 最大批次大小
+    # 文本批次可以较大,因为文本嵌入占用内存较少
+    TEXT_MAX_BATCH_SIZE = 16  # 文本最大批次大小
+    # 图像批次需要较小,因为图像嵌入占用大量 GPU 内存
+    IMAGE_MAX_BATCH_SIZE = 2  # 图像最大批次大小 (降低以避免 OOM)
+    # 融合嵌入批次也需要较小
+    FUSED_MAX_BATCH_SIZE = 2  # 融合嵌入最大批次大小
     MAX_WAIT_MS = 50  # 最大等待时间(毫秒)
     ENABLE_BATCHING = True  # 是否启用批处理
 
@@ -170,11 +178,15 @@ class BatchProcessor:
     def __init__(
         self,
         model,
-        max_batch_size: int = 16,
+        text_max_batch_size: int = 16,
+        image_max_batch_size: int = 2,
+        fused_max_batch_size: int = 2,
         max_wait_ms: int = 50,
     ):
         self.model = model
-        self.max_batch_size = max_batch_size
+        self.text_max_batch_size = text_max_batch_size
+        self.image_max_batch_size = image_max_batch_size
+        self.fused_max_batch_size = fused_max_batch_size
         self.max_wait_seconds = max_wait_ms / 1000.0
 
         # 为不同类型的请求维护独立队列
@@ -232,7 +244,7 @@ class BatchProcessor:
         self.text_processing = True
 
         while self.text_queue:
-            batch = await self._collect_batch(self.text_queue)
+            batch = await self._collect_batch(self.text_queue, self.text_max_batch_size)
 
             if batch:
                 await self._execute_text_batch(batch)
@@ -248,7 +260,7 @@ class BatchProcessor:
         self.image_processing = True
 
         while self.image_queue:
-            batch = await self._collect_batch(self.image_queue)
+            batch = await self._collect_batch(self.image_queue, self.image_max_batch_size)
 
             if batch:
                 await self._execute_image_batch(batch)
@@ -263,7 +275,7 @@ class BatchProcessor:
         self.fused_processing = True
 
         while self.fused_queue:
-            batch = await self._collect_batch(self.fused_queue)
+            batch = await self._collect_batch(self.fused_queue, self.fused_max_batch_size)
 
             if batch:
                 await self._execute_fused_batch(batch)
@@ -273,12 +285,12 @@ class BatchProcessor:
 
         self.fused_processing = False
 
-    async def _collect_batch(self, queue: deque) -> List[BatchRequest]:
+    async def _collect_batch(self, queue: deque, max_batch_size: int) -> List[BatchRequest]:
         """从队列中收集批次"""
         batch = []
         deadline = time.time() + self.max_wait_seconds
 
-        while len(batch) < self.max_batch_size and queue:
+        while len(batch) < max_batch_size and queue:
             # 如果已有请求且超时，立即处理
             if time.time() > deadline and batch:
                 break
@@ -286,7 +298,7 @@ class BatchProcessor:
             batch.append(queue.popleft())
 
             # 如果队列空了，等待一小段时间看是否有新请求
-            if not queue and len(batch) < self.max_batch_size:
+            if not queue and len(batch) < max_batch_size:
                 remaining_time = deadline - time.time()
                 if remaining_time > 0:
                     await asyncio.sleep(min(0.001, remaining_time))
@@ -363,6 +375,11 @@ class BatchProcessor:
 
             print(f"[DEBUG] 图片预处理完成,准备调用模型")
 
+            # 清理 GPU 缓存以释放内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print(f"[DEBUG] GPU 缓存已清理")
+
             # 批量推理
             is_query = batch[0].kwargs.get("is_query", True)
             embeddings = await asyncio.to_thread(
@@ -372,6 +389,10 @@ class BatchProcessor:
             )
 
             print(f"[DEBUG] 模型推理完成,嵌入向量形状: {embeddings.shape}")
+
+            # 推理后再次清理 GPU 缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # 分发结果
             offset = 0
@@ -390,6 +411,10 @@ class BatchProcessor:
             print(f"[ERROR] 错误堆栈:")
             traceback.print_exc()
 
+            # 清理 GPU 缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             for req in batch:
                 if not req.future.done():
                     req.future.set_exception(e)
@@ -398,6 +423,11 @@ class BatchProcessor:
         """执行融合嵌入批处理"""
         try:
             print(f"[DEBUG] 开始处理融合嵌入批次: {len(batch)} 个请求")
+
+            # 清理 GPU 缓存以释放内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                print(f"[DEBUG] GPU 缓存已清理")
 
             # 融合嵌入通常需要配对处理，批处理较复杂
             # 这里采用简化策略：逐个处理但在线程池中并发
@@ -426,6 +456,10 @@ class BatchProcessor:
                     traceback.print_exc()
                     req.future.set_exception(e)
 
+            # 推理后清理 GPU 缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             print(f"[DEBUG] 融合嵌入批次处理完成")
             self.stats["batched_requests"] += len(batch)
 
@@ -435,6 +469,10 @@ class BatchProcessor:
             print(f"[ERROR] 错误信息: {str(e)}")
             print(f"[ERROR] 错误堆栈:")
             traceback.print_exc()
+
+            # 清理 GPU 缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             for req in batch:
                 if not req.future.done():
@@ -487,10 +525,16 @@ async def lifespan(app: FastAPI):
         if BatchConfig.ENABLE_BATCHING:
             batch_processor = BatchProcessor(
                 model=gme,
-                max_batch_size=BatchConfig.MAX_BATCH_SIZE,
+                text_max_batch_size=BatchConfig.TEXT_MAX_BATCH_SIZE,
+                image_max_batch_size=BatchConfig.IMAGE_MAX_BATCH_SIZE,
+                fused_max_batch_size=BatchConfig.FUSED_MAX_BATCH_SIZE,
                 max_wait_ms=BatchConfig.MAX_WAIT_MS,
             )
-            print(f"✓ 批处理已启用 (批次大小: {BatchConfig.MAX_BATCH_SIZE}, 等待时间: {BatchConfig.MAX_WAIT_MS}ms)")
+            print(f"✓ 批处理已启用:")
+            print(f"  - 文本批次大小: {BatchConfig.TEXT_MAX_BATCH_SIZE}")
+            print(f"  - 图像批次大小: {BatchConfig.IMAGE_MAX_BATCH_SIZE}")
+            print(f"  - 融合批次大小: {BatchConfig.FUSED_MAX_BATCH_SIZE}")
+            print(f"  - 等待时间: {BatchConfig.MAX_WAIT_MS}ms")
         else:
             print("✗ 批处理已禁用")
 
@@ -528,7 +572,9 @@ async def root():
         "model": "iic/gme-Qwen2-VL-7B-Instruct",
         "batching_enabled": BatchConfig.ENABLE_BATCHING,
         "batch_config": {
-            "max_batch_size": BatchConfig.MAX_BATCH_SIZE,
+            "text_max_batch_size": BatchConfig.TEXT_MAX_BATCH_SIZE,
+            "image_max_batch_size": BatchConfig.IMAGE_MAX_BATCH_SIZE,
+            "fused_max_batch_size": BatchConfig.FUSED_MAX_BATCH_SIZE,
             "max_wait_ms": BatchConfig.MAX_WAIT_MS,
         },
         "stats": stats,
